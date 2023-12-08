@@ -1,0 +1,95 @@
+import pandas as pd
+from openpyxl import load_workbook
+
+file_path = r"C:\Users\ADCCYW9\Downloads\Automation Files\RREPO\\"
+file_name = input("Enter the file name: ")
+file_type = ".xlsx"
+header_row = 1
+
+file_full_path = file_path + file_name + file_type
+
+rrepo_tlm = pd.read_excel(file_full_path, header = header_row)
+# rrepo_tlm = pd.read_excel(r"C:\Users\ADCCYW9\Downloads\Automation Files\RREPO\Asset BO 1004.xlsx", header = 1)
+#nexen_holding = pd.read_excel(r"C:\Users\ADCCYW9\Downloads\Automation Files\RREPO\Custody_Holdings 1004.xlsx")
+rrepo_tlm_repo = rrepo_tlm.loc[(rrepo_tlm['Security Name'].str.contains('REPO') == True)]
+accounts = rrepo_tlm_repo['Account ID Number'].unique().tolist()
+rrepo_tlm_recon = rrepo_tlm[rrepo_tlm['Account ID Number'].isin(accounts)]
+
+rrepo_items = rrepo_tlm_repo[['Account ID Number', 'Exception Id', 'Security Name']]
+rrepo_items['CUSIP'] = rrepo_items['Security Name'].str.split('_', expand=True).loc[:, 1]
+rrepo_items['Original Face'] = rrepo_items['Security Name'].str.split('_', expand=True).loc[:, 2]
+rrepo_items['Original Face'] = rrepo_items['Original Face'][rrepo_items['Original Face'].notna()].astype(int)
+
+path = file_full_path
+output = load_workbook(path)
+with pd.ExcelWriter(path, engine = 'openpyxl', mode = 'a') as writer:  
+    rrepo_items.to_excel(writer, sheet_name='RREPO_ITEMS', index = False)
+
+rrepo_items = rrepo_items.groupby(['CUSIP']).agg({'Account ID Number' : 'max', 'Exception Id' : list, 'CUSIP' :'max', 'Original Face' : 'sum'})
+rrepo_cusip = rrepo_items['CUSIP'].unique().tolist()
+
+#rrepo_nexen = nexen_holding[nexen_holding['CUSIP/CINS'].isin(rrepo_cusip)] #Building
+#IMAB030 Cusip can be found at ledger cusip
+#IMAB020 Sedol to link the account and the OF will be the Quantity
+def secur_cusip_tlm(row):
+    if pd.isnull(row['Stmt CUSIP:SEDOL:ISIN']):
+        ledger_cusip = row['Ledger CUSIP:SEDOL:ISIN'].split(':')[0]
+        return ledger_cusip
+    elif pd.isnull(row['Ledger CUSIP:SEDOL:ISIN']):
+        stmt_cusip = row['Stmt CUSIP:SEDOL:ISIN'].split(':')[0] 
+        return stmt_cusip
+    else:
+        stmt_cusip = row['Stmt CUSIP:SEDOL:ISIN'].split(':')[0] 
+        return stmt_cusip        
+rrepo_tlm_recon['SECUR_CUSIP'] = rrepo_tlm_recon.apply(secur_cusip_tlm, axis=1)
+
+rrepo_related = rrepo_tlm_recon[rrepo_tlm_recon['SECUR_CUSIP'].isin(rrepo_cusip)]
+rrepo_related['Statement OF'] = rrepo_related['Stmt OF : Current Factor : Current Fatcor Date : Contract Size'].str.split('-', expand=True).loc[:, 0].fillna('OF:0')
+rrepo_related['Statement OF'] = rrepo_related['Statement OF'].str.split(':', expand=True).loc[:, 1].astype(int)
+rrepo_related['Ledger OF'] = rrepo_related['Ledger OF : Current Factor : Current Fatcor Date : Contract Size'].str.split('-', expand=True).loc[:, 0]
+rrepo_related['Ledger OF'] = rrepo_related['Ledger OF'].str.split(':', expand=True).loc[:, 1]
+rrepo_related['Ledger OF'] = rrepo_related['Ledger OF'].fillna(0).astype(int)
+def ledger_original_face(rrepo_related):
+    if(rrepo_related['Ledger OF'] == 0):
+        ledger_of = int(rrepo_related['Ledger Quantity'])
+        return ledger_of 
+    elif(rrepo_related['Ledger OF'] != 0):
+        ledger_of = int(rrepo_related['Ledger OF'])
+        return ledger_of 
+def original_face_related(rrepo_related):
+    original_face = rrepo_related['Ledger OF'] - rrepo_related['Statement OF']
+    return original_face 
+rrepo_related['Ledger OF'] = rrepo_related.apply(ledger_original_face, axis = 1)
+rrepo_related['Original Face_SECUR'] = rrepo_related.apply(original_face_related, axis = 1)
+rrepo_related = rrepo_related[['Account ID Number', 'Exception Id', 'Security Name', 'SECUR_CUSIP', 'Statement OF', 'Ledger OF','Original Face_SECUR']]
+
+with pd.ExcelWriter(path, engine = 'openpyxl', mode = 'a') as writer:  
+    rrepo_related.to_excel(writer, sheet_name='RREPO_SECUR', index = False)
+
+rrepo_related = rrepo_related.groupby(['Exception Id']).agg({'Account ID Number' : 'max', 'Exception Id' : 'max', 'Security Name' : 'max', 'SECUR_CUSIP' :'max', 'Statement OF': list, 'Ledger OF' : list,'Original Face_SECUR' : 'sum'})
+rrepo_related.rename(columns = {'Exception Id': 'Exception ID_SECUR'}, inplace = True)
+
+def condition(final):
+    conditions = final['Original Face'] - final['Original Face_SECUR']
+    if(abs(conditions) <= 0.001):   
+        return 'Match'
+    elif pd.isnull(final['Original Face_SECUR']):
+        return 'RREPO Only'
+    else:
+        return 'No Match'
+def difference(final):
+    differences = final['Original Face'] - abs(final['Original Face_SECUR'])
+    return differences
+
+r_rrepo = '({})'.format('|'.join(rrepo_items['CUSIP']))
+merge_df = rrepo_related['SECUR_CUSIP'].str.extract(r_rrepo, expand = False).fillna(rrepo_related['SECUR_CUSIP'])
+rrepo_items.rename(columns = {'CUSIP': 'CUSIP_RREPO'}, inplace = True)
+final = rrepo_items.merge(rrepo_related.drop(['SECUR_CUSIP', 'Account ID Number'], axis = 1), left_on='CUSIP_RREPO', right_on = merge_df, how = 'outer')
+final['Match Result'] = final.apply(condition, axis = 1)
+final['Difference'] = final.apply(difference, axis = 1).fillna(0)
+
+cols = ['Account ID Number', 'CUSIP_RREPO', 'Exception Id', 'Exception ID_SECUR', 'Security Name', 'Statement OF', 'Ledger OF', 'Original Face_SECUR', 'Original Face', 'Match Result', 'Difference']
+final = final[cols]
+
+with pd.ExcelWriter(path, engine = 'openpyxl', mode = 'a') as writer:
+    final.to_excel(writer, sheet_name = 'RREPO_RECON', index = False)
